@@ -1,0 +1,11 @@
+[package]
+name = "multi-producer-sink"
+version = "0.1.0"
+authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
+description = "Split a sink into multiple subsinks all writing to the same underlying sink."
+repository = "https://github.com/AljoschaMeyer/box-stream-rs"
+readme = "README.md"
+license = "GPL-3.0"
+
+[dependencies]
+futures = "0.1.17"
