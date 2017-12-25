@@ -1,4 +1,3 @@
-#[macro_use]
 extern crate futures;
 
 #[cfg(test)]
@@ -10,16 +9,12 @@ extern crate void;
 #[cfg(test)]
 extern crate atm_async_utils;
 
-use std::collections::vec_deque::VecDeque;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::cell::{Cell, UnsafeCell};
 use std::mem;
 use std::ptr;
 
-use futures::{Sink, Poll, StartSend, AsyncSink, Async, Future, Stream};
-use futures::Async::{Ready, NotReady};
-use futures::stream::Fuse;
+use futures::{Sink, Poll, StartSend, AsyncSink, Async};
 use futures::task::{Task, current};
 
 /// A wrapper around a Sink . The `sub_sink` method can be used to obtain
@@ -106,17 +101,6 @@ impl<S: Sink> MainSinkImpl<S>
         }
     }
 
-    /// Consumes the `MainSink` and returns ownership of the underlying sink.
-    /// If the sink has errored, this also returns ownership of the error.
-    pub fn into_inner(self) -> (S, Option<S::SinkError>) {
-        (self.sink,
-         if self.did_error {
-             Some(self.error)
-         } else {
-             None
-         })
-    }
-
     // Only use this for setting this.error, everything else is undefined behaviour.
     fn set_error(&mut self, e: S::SinkError) {
         unsafe { ptr::write(&mut self.error as *mut S::SinkError, e) };
@@ -161,7 +145,7 @@ impl<S: Sink> MainSinkImpl<S>
                         }
                     }
                 }
-                Some((id, _)) => {
+                Some((current_id, _)) if current_id == id => {
                     println!("Send: blocking on own id: {}", id);
                     // Blocking on this task, try it again
                     match self.sink.start_send(item) {
@@ -244,7 +228,7 @@ impl<S: Sink> MainSinkImpl<S>
                         }
                     }
                 }
-                Some((id, _)) => {
+                Some((current_id, _)) if current_id == id => {
                     println!("complete: blocking on own id: {}", id);
                     // Blocking on this task, try it again
                     match self.sink.poll_complete() {
@@ -342,158 +326,19 @@ impl<'s, S: Sink> Sink for SubSink<'s, S>
     }
 }
 
-// TODO move to utils
-/// Future which closes a sink.
-pub struct Close<S: Sink> {
-    sink: Option<S>,
-}
-
-impl<S: Sink> Close<S> {
-    pub fn new(s: S) -> Close<S> {
-        Close { sink: Some(s) }
-    }
-
-    /// Get a shared reference to the inner sink.
-    pub fn get_ref(&self) -> &S {
-        self.sink
-            .as_ref()
-            .take()
-            .expect("Attempted Close::get_ref after completion")
-    }
-
-    /// Get a mutable reference to the inner sink.
-    pub fn get_mut(&mut self) -> &mut S {
-        self.sink
-            .as_mut()
-            .take()
-            .expect("Attempted Close::get_mut after completion")
-    }
-}
-
-impl<S: Sink> Future for Close<S> {
-    type Item = S;
-    type Error = S::SinkError;
-
-    fn poll(&mut self) -> Poll<S, S::SinkError> {
-        let mut s = self.sink
-            .take()
-            .expect("Attempted to poll Close after completion");
-
-        match s.close() {
-            Ok(Async::Ready(_)) => {
-                return Ok(Async::Ready(s));
-            }
-            Ok(Async::NotReady) => {
-                self.sink = Some(s);
-                return Ok(Async::NotReady);
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-}
-
-// TODO move to utils
-/// Future which sends all items from a Stream into a Sink. Unlike the tokio SendAll Future, this
-/// does not close the sink (it does flush though).
-pub struct SendAll<T, U: Stream> {
-    sink: Option<T>,
-    stream: Option<Fuse<U>>,
-    buffered: Option<U::Item>,
-}
-
-impl<T, U> SendAll<T, U>
-    where T: Sink,
-          U: Stream<Item = T::SinkItem>,
-          T::SinkError: From<U::Error>
-{
-    pub fn new(sink: T, stream: U) -> SendAll<T, U> {
-        SendAll {
-            sink: Some(sink),
-            stream: Some(stream.fuse()),
-            buffered: None,
-        }
-    }
-
-    fn sink_mut(&mut self) -> &mut T {
-        self.sink
-            .as_mut()
-            .take()
-            .expect("Attempted to poll SendAll after completion")
-    }
-
-    fn stream_mut(&mut self) -> &mut Fuse<U> {
-        self.stream
-            .as_mut()
-            .take()
-            .expect("Attempted to poll SendAll after completion")
-    }
-
-    fn take_result(&mut self) -> (T, U) {
-        let sink = self.sink
-            .take()
-            .expect("Attempted to poll Forward after completion");
-        let fuse = self.stream
-            .take()
-            .expect("Attempted to poll Forward after completion");
-        (sink, fuse.into_inner())
-    }
-
-    fn try_start_send(&mut self, item: U::Item) -> Poll<(), T::SinkError> {
-        debug_assert!(self.buffered.is_none());
-        if let AsyncSink::NotReady(item) = self.sink_mut().start_send(item)? {
-            self.buffered = Some(item);
-            return Ok(Async::NotReady);
-        }
-        Ok(Async::Ready(()))
-    }
-}
-
-impl<T, U> Future for SendAll<T, U>
-    where T: Sink,
-          U: Stream<Item = T::SinkItem>,
-          T::SinkError: From<U::Error>
-{
-    type Item = (T, U);
-    type Error = T::SinkError;
-
-    fn poll(&mut self) -> Poll<(T, U), T::SinkError> {
-        // If we've got an item buffered already, we need to write it to the
-        // sink before we can do anything else
-        if let Some(item) = self.buffered.take() {
-            try_ready!(self.try_start_send(item))
-        }
-
-        loop {
-            match self.stream_mut().poll()? {
-                Async::Ready(Some(item)) => try_ready!(self.try_start_send(item)),
-                Async::Ready(None) => {
-                    return Ok(Async::Ready(self.take_result()));
-                }
-                Async::NotReady => {
-                    try_ready!(self.sink_mut().poll_complete());
-                    return Ok(Async::NotReady);
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use futures::{Future, Stream};
-    use futures::future::poll_fn;
     use futures::stream::iter_ok;
 
-    use quickcheck::{QuickCheck, StdGen, Gen, Arbitrary};
+    use quickcheck::{QuickCheck, StdGen};
     use rand;
     use void::Void;
-    use rand::Rng;
     use atm_async_utils::test_channel::*;
     use atm_async_utils::test_sink::*;
+    use atm_async_utils::sink_futures::{Close, SendAll};
 
     #[test]
     fn test_errors() {
@@ -511,13 +356,11 @@ mod tests {
     #[test]
     fn test_success() {
         let rng = StdGen::new(rand::thread_rng(), 50);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000); // TODO increase number of runs
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
         quickcheck.quickcheck(success as fn(usize) -> bool);
     }
 
     fn success(buf_size: usize) -> bool {
-        println!("");
-        println!("test with buffer of size {}", buf_size + 1);
         let (sender, receiver) = test_channel::<u8, Void, Void>(buf_size + 1);
 
         let main = MainSink::new(sender);
@@ -534,13 +377,9 @@ mod tests {
         let sending = send_all1
             .join4(send_all2, send_all3, send_all4)
             .map_err(|x| *x)
-            .and_then(|(_, _, _, (s4, _))| {
-                          println!("reached close-closure");
-                          Close::new(s4).map_err(|x| *x)
-                      });
+            .and_then(|(_, _, _, (s4, _))| Close::new(s4).map_err(|x| *x));
 
         let (mut received, _) = receiver.collect().join(sending).wait().unwrap();
-        println!("{:?}", received);
         received.sort();
 
         return received == (0..40).collect::<Vec<u8>>();
