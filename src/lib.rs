@@ -11,6 +11,8 @@ extern crate void;
 extern crate atm_async_utils;
 
 use std::collections::vec_deque::VecDeque;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::cell::{Cell, UnsafeCell};
 use std::mem;
 use std::ptr;
@@ -83,10 +85,11 @@ struct MainSinkImpl<S: Sink> {
     // and the `did_error` flag is used to check whether the error field contains
     // a valid error.
     did_error: bool,
-    // Tasks blocked on `start_send`, with the id of their SubSink.
-    send_tasks: VecDeque<(Task, usize)>,
-    // Tasks blocked on `poll_complete`, with the id of their SubSink.
-    complete_tasks: VecDeque<(Task, usize)>,
+    // Id and task of the SubSink that caused the currently blocking call. None when not blocking.
+    current: Option<(usize, Task)>,
+    // Ids and Tasks of all other SubSinks that want to use the sink but can't since it is currently
+    // blocking.
+    tasks: HashMap<usize, Task>,
 }
 
 impl<S: Sink> MainSinkImpl<S>
@@ -98,8 +101,8 @@ impl<S: Sink> MainSinkImpl<S>
             sink,
             error: unsafe { mem::uninitialized() },
             did_error: false,
-            send_tasks: VecDeque::new(),
-            complete_tasks: VecDeque::new(),
+            current: None,
+            tasks: HashMap::new(),
         }
     }
 
@@ -119,6 +122,10 @@ impl<S: Sink> MainSinkImpl<S>
         unsafe { ptr::write(&mut self.error as *mut S::SinkError, e) };
 
         self.did_error = true;
+
+        for (_, task) in self.tasks.iter() {
+            task.notify();
+        }
     }
 
     fn start_send(&mut self,
@@ -126,29 +133,17 @@ impl<S: Sink> MainSinkImpl<S>
                   id: usize)
                   -> StartSend<S::SinkItem, &S::SinkError> {
         println!("impl start_send, id: {}, item: {:?}", id, item);
-        println!("send_tasks: {:?}", self.send_tasks);
+        println!("tasks: {:?}", self.tasks);
         if self.did_error {
             // After the first error, stop normal operation.
             Err(&self.error)
         } else {
             println!("send: not errored");
-            // We haven't errored yet, so check whether we are blocking on anything.
-            if self.complete_tasks.is_empty() {
-                println!("send: no complete tasks");
-                // Due to multiple mutable references, we can not simply match on
-                // `self.send_tasks.get(0)`, so we do a little dance to appease
-                // the compiler.
-                let is_empty;
-                let front_id;
-                {
-                    let front = self.send_tasks.get(0);
-                    is_empty = front.is_none();
-                    front_id = front.map_or(0, |pair| pair.1);
-                }
 
-                if is_empty {
-                    println!("send: no send tasks");
-                    // Underlying sink is not blocking at all.
+            match self.current {
+                None => {
+                    // Not blocking on anything, use the sink.
+                    println!("send: not blocking on anything");
                     match self.sink.start_send(item) {
                         Ok(AsyncSink::Ready) => {
                             println!("send: sent to inner");
@@ -156,7 +151,8 @@ impl<S: Sink> MainSinkImpl<S>
                         }
                         Ok(AsyncSink::NotReady(item)) => {
                             println!("send: blocking on inner send, own id: {}", id);
-                            self.send_tasks.push_back((current(), id));
+                            self.current = Some((id, current()));
+                            // self.tasks.insert(id, current());
                             return Ok(AsyncSink::NotReady(item));
                         }
                         Err(e) => {
@@ -164,43 +160,55 @@ impl<S: Sink> MainSinkImpl<S>
                             return Err(&self.error);
                         }
                     }
-                } else {
-                    println!("send: blocking on send");
-                    // Underlying sink is blocking on poll_send.
-                    if id == front_id {
-                        println!("send: blocking on this, own id: {}", id);
-                        // The underlying sink woke the task, so we can try again.
-                        match self.sink.start_send(item) {
-                            Ok(AsyncSink::Ready) => {
-                                let _ = self.send_tasks.pop_front();
-                                println!("popped from front, own: {}, front: {}", id, front_id);
-                                // notify the next task
-                                let front = self.send_tasks.get(0);
-                                front.map(|entry| entry.0.notify());
-                                return Ok(AsyncSink::Ready);
+                }
+                Some((id, _)) => {
+                    println!("Send: blocking on own id: {}", id);
+                    // Blocking on this task, try it again
+                    match self.sink.start_send(item) {
+                        Ok(AsyncSink::Ready) => {
+                            self.current = None;
+                            println!("removed task: {}", id);
+
+                            // notify the next task
+                            let next = self.tasks.iter().next();
+                            match next {
+                                None => {
+                                    // noop, nothing needs to be notified
+                                    println!("no further tasks to notify");
+                                }
+                                Some((id, task)) => {
+                                    task.notify();
+                                    println!("notified {}", id);
+                                }
                             }
-                            Ok(AsyncSink::NotReady(item)) => {
-                                println!("blocked for {}", id);
-                                return Ok(AsyncSink::NotReady(item));
-                            }
-                            Err(e) => {
-                                let _ = self.send_tasks.pop_front();
-                                self.set_error(e);
-                                return Err(&self.error);
-                            }
+
+                            return Ok(AsyncSink::Ready);
                         }
+                        Ok(AsyncSink::NotReady(item)) => {
+                            println!("still blocking for {}", id);
+                            return Ok(AsyncSink::NotReady(item));
+                        }
+                        Err(e) => {
+                            self.current = None;
+                            self.set_error(e);
+                            return Err(&self.error);
+                        }
+                    }
+                }
+                Some((current_id, ref task)) => {
+                    println!("send: blocking on other id: {}", current_id);
+                    // Blocking on some other task, notify it and park this one
+                    if self.tasks.insert(id, current()).is_none() {
+                        println!("parked {}", id);
+                        return Ok(AsyncSink::NotReady(item));
                     } else {
-                        println!("send: blocking on other, own id: {}", id);
-                        // Blocking on another send task
-                        self.send_tasks.push_back((current(), id));
+                        // This call was triggered because inner sink notified the task, so wake up
+                        // the current one
+                        task.notify();
+                        println!("notified current");
                         return Ok(AsyncSink::NotReady(item));
                     }
                 }
-            } else {
-                println!("send: blocking on complete");
-                // The underlying sink is blocking on poll_complete.
-                self.send_tasks.push_back((current(), id));
-                return Ok(AsyncSink::NotReady(item));
             }
         }
     }
@@ -209,33 +217,25 @@ impl<S: Sink> MainSinkImpl<S>
     // a mutable reference.
     fn poll_complete(&mut self, id: usize) -> Poll<(), &S::SinkError> {
         println!("impl poll_complete, id: {}", id);
+        println!("tasks: {:?}", self.tasks);
         if self.did_error {
+            // After the first error, stop normal operation.
             Err(&self.error)
         } else {
             println!("complete: not errored");
-            // We haven't errored yet, so check whether we are blocking on anything.
-            if self.send_tasks.is_empty() {
-                println!("complete: no sends");
-                // Due to multiple mutable references, we can not simply match on
-                // `self.send_tasks.get(0)`, so we do a little dance to appease
-                // the compiler.
-                let is_empty;
-                let front_id;
-                {
-                    let front = self.complete_tasks.get(0);
-                    is_empty = front.is_none();
-                    front_id = front.map_or(0, |pair| pair.1);
-                }
 
-                if is_empty {
-                    println!("complete: not blocking at all");
-                    // Underlying sink is not blocking at all.
+            match self.current {
+                None => {
+                    // Not blocking on anything, use the sink.
+                    println!("complete: not blocking on anything");
                     match self.sink.poll_complete() {
                         Ok(Async::Ready(_)) => {
+                            println!("complete: completed inner");
                             return Ok(Async::Ready(()));
                         }
                         Ok(Async::NotReady) => {
-                            self.complete_tasks.push_back((current(), id));
+                            println!("complete: blocking on inner complete, own id: {}", id);
+                            self.current = Some((id, current()));
                             return Ok(Async::NotReady);
                         }
                         Err(e) => {
@@ -243,34 +243,55 @@ impl<S: Sink> MainSinkImpl<S>
                             return Err(&self.error);
                         }
                     }
-                } else {
-                    // Underlying sink is blocking on poll_complete.
-                    if id == front_id {
-                        // The underlying sink woke the task, so we can try again.
-                        match self.sink.poll_complete() {
-                            Ok(Async::Ready(_)) => {
-                                let _ = self.complete_tasks.pop_front();
-                                return Ok(Async::Ready(()));
+                }
+                Some((id, _)) => {
+                    println!("complete: blocking on own id: {}", id);
+                    // Blocking on this task, try it again
+                    match self.sink.poll_complete() {
+                        Ok(Async::Ready(_)) => {
+                            self.current = None;
+                            println!("removed task: {}", id);
+
+                            // notify the next task
+                            let next = self.tasks.iter().next();
+                            match next {
+                                None => {
+                                    // noop, nothing needs to be notified
+                                    println!("no further tasks to notify");
+                                }
+                                Some((id, task)) => {
+                                    task.notify();
+                                    println!("notified {}", id);
+                                }
                             }
-                            Ok(Async::NotReady) => {
-                                return Ok(Async::NotReady);
-                            }
-                            Err(e) => {
-                                let _ = self.complete_tasks.pop_front();
-                                self.set_error(e);
-                                return Err(&self.error);
-                            }
+
+                            return Ok(Async::Ready(()));
                         }
+                        Ok(Async::NotReady) => {
+                            println!("still blocking for {}", id);
+                            return Ok(Async::NotReady);
+                        }
+                        Err(e) => {
+                            self.current = None;
+                            self.set_error(e);
+                            return Err(&self.error);
+                        }
+                    }
+                }
+                Some((current_id, ref task)) => {
+                    println!("complete: blocking on other id: {}", current_id);
+                    // Blocking on some other task, notify it and park this one
+                    if self.tasks.insert(id, current()).is_none() {
+                        println!("parked {}", id);
+                        return Ok(Async::NotReady);
                     } else {
-                        // Blocking on another complete task
-                        self.complete_tasks.push_back((current(), front_id));
+                        // This call was triggered because inner sink notified the task, so wake up
+                        // the current one
+                        task.notify();
+                        println!("notified current");
                         return Ok(Async::NotReady);
                     }
                 }
-            } else {
-                // The underlying sink is blocking on start_send.
-                self.complete_tasks.push_back((current(), id));
-                return Ok(Async::NotReady);
             }
         }
     }
@@ -474,7 +495,7 @@ mod tests {
     use atm_async_utils::test_channel::*;
     use atm_async_utils::test_sink::*;
 
-    // #[test] // TODO enable this test
+    #[test]
     fn test_errors() {
         let (sender, _) = test_channel::<u8, u8, Void>(8);
         let main =
@@ -496,10 +517,8 @@ mod tests {
 
     fn success(buf_size: usize) -> bool {
         println!("");
-        // println!("test with buffer of size {}", buf_size + 1);
-        // let (sender, receiver) = test_channel::<u8, Void, Void>(buf_size + 1);
-        println!("test with buffer of size {}", 1);
-        let (sender, receiver) = test_channel::<u8, Void, Void>(1);
+        println!("test with buffer of size {}", buf_size + 1);
+        let (sender, receiver) = test_channel::<u8, Void, Void>(buf_size + 1);
 
         let main = MainSink::new(sender);
 
@@ -519,8 +538,6 @@ mod tests {
                           println!("reached close-closure");
                           Close::new(s4).map_err(|x| *x)
                       });
-
-        // TODO test flushing
 
         let (mut received, _) = receiver.collect().join(sending).wait().unwrap();
         println!("{:?}", received);
