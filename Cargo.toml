@@ -9,3 +9,9 @@ license = "GPL-3.0"
 
 [dependencies]
 futures = "0.1.17"
+
+[dev-dependencies]
+quickcheck = "0.4.1"
+rand = "0.3.18"
+atm-async-utils = { git = "https://github.com/AljoschaMeyer/atm-async-utils" }
+void = { git = "https://github.com/AljoschaMeyer/rust-void" }
