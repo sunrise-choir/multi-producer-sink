@@ -22,9 +22,7 @@ use futures::task::{Task, current};
 // The usize is a counter to assign ids to SubSinks.
 pub struct MainSink<S: Sink>(UnsafeCell<MainSinkImpl<S>>, Cell<usize>);
 
-impl<S: Sink> MainSink<S>
-    where <S as futures::Sink>::SinkItem: std::fmt::Debug
-{
+impl<S: Sink> MainSink<S> {
     /// Consumes a Sink and returns a corresponding MainSink.
     pub fn new(sink: S) -> MainSink<S> {
         MainSink(UnsafeCell::new(MainSinkImpl::new(sink)), Cell::new(0))
@@ -69,6 +67,11 @@ impl<S: Sink> MainSink<S>
         let inner = unsafe { &mut *self.0.get() };
         inner.close()
     }
+
+    fn remove_subsink(&self, id: usize) {
+        let inner = unsafe { &mut *self.0.get() };
+        inner.remove_subsink(id)
+    }
 }
 
 struct MainSinkImpl<S: Sink> {
@@ -87,9 +90,7 @@ struct MainSinkImpl<S: Sink> {
     tasks: HashMap<usize, Task>,
 }
 
-impl<S: Sink> MainSinkImpl<S>
-    where <S as futures::Sink>::SinkItem: std::fmt::Debug
-{
+impl<S: Sink> MainSinkImpl<S> {
     /// Consumes a Sink and returns a corresponding MainSink.
     pub fn new(sink: S) -> MainSinkImpl<S> {
         MainSinkImpl {
@@ -258,14 +259,50 @@ impl<S: Sink> MainSinkImpl<S>
             }
         }
     }
+
+    fn remove_subsink(&mut self, id: usize) {
+        self.tasks.remove(&id);
+
+        let has_current;
+        let current_id;
+
+        {
+            match self.current {
+                Some((cid, _)) => {
+                    has_current = true;
+                    current_id = cid;
+                }
+                None => {
+                    has_current = false;
+                    current_id = 0;
+                }
+            }
+        }
+
+        if has_current && current_id == id {
+            let mut some_id = 0;
+            {
+                let some_entry;
+                some_entry = self.tasks.iter().next();
+
+                if some_entry.is_none() {
+                    self.current = None;
+                    return;
+                } else {
+                    some_entry.map(|(key, _)| some_id = *key);
+                }
+            }
+
+            let some_task = self.tasks.remove(&some_id).unwrap();
+            self.current = Some((some_id, some_task));
+        }
+    }
 }
 
 // The usize is an id used to match enqueued tasks.
 pub struct SubSink<'s, S: 's + Sink>(&'s MainSink<S>, usize);
 
-impl<'s, S: Sink> Sink for SubSink<'s, S>
-    where <S as futures::Sink>::SinkItem: std::fmt::Debug
-{
+impl<'s, S: Sink> Sink for SubSink<'s, S> {
     type SinkItem = S::SinkItem;
     /// Errors are references to the first error that occured on the underlying Sink.
     /// Once an error happend, start_send and poll_complete will always return a
@@ -287,6 +324,12 @@ impl<'s, S: Sink> Sink for SubSink<'s, S>
     /// closing this while other SubSinks are still active.
     fn close(&mut self) -> Poll<(), Self::SinkError> {
         self.0.close()
+    }
+}
+
+impl<'s, S: Sink> Drop for SubSink<'s, S> {
+    fn drop(&mut self) {
+        self.0.remove_subsink(self.1);
     }
 }
 
