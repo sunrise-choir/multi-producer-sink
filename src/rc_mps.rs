@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::hash::{Hash, Hasher};
 
 use futures::{Sink, AsyncSink, StartSend, Poll, Async};
 use futures::task::{self, Task};
 use ordermap::OrderSet;
+
+use id_task::IdTask;
 
 /// A *m*ulti *p*roducer *s*ink (`MPS`). This is a cloneable handle to a single
 /// sink of type `S`, and each handle can be used to write to the inner sink.
@@ -87,32 +88,6 @@ impl<S: Sink> Sink for MPS<S> {
         shared.do_close(Rc::strong_count(&self.shared), self.id)
     }
 }
-
-#[derive(Clone)]
-struct IdTask {
-    task: Task,
-    id: usize,
-}
-
-impl IdTask {
-    fn new(task: Task, id: usize) -> IdTask {
-        IdTask { task, id }
-    }
-}
-
-impl Hash for IdTask {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state)
-    }
-}
-
-impl PartialEq for IdTask {
-    fn eq(&self, rhs: &IdTask) -> bool {
-        self.id == rhs.id
-    }
-}
-
-impl Eq for IdTask {}
 
 struct Shared<S> {
     inner: S,
@@ -332,7 +307,7 @@ mod tests {
     #[test]
     fn test_success() {
         let rng = StdGen::new(rand::thread_rng(), 50);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
         quickcheck.quickcheck(success as fn(usize) -> bool);
     }
 
