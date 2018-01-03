@@ -4,9 +4,19 @@ use futures::{Sink, StartSend, Poll};
 
 use shared::*;
 
-/// A multiple producer sink that works via lifetimes rather than reference
-/// counting. This wraps a sink, and allows to obtain handles to the inner sink
-/// that can use it independently. The handles can not outlive the `OwnerMPS`.
+/// A multiple producer sink (MPS) that works via lifetimes rather than reference
+/// counting. This wraps a sink, and allows to obtain handles which can write to
+/// the inner sink. These handles can not outlive the `OwnerMPS`.
+///
+/// Errors are simply propagated to the handle that triggered it, but they are
+/// not stored. This means that other handles might still try to write to the
+/// sink after it errored. Make sure to use a sink that can deal with this.
+///
+/// Each of the handles must invoke `close` before being dropped. The inner sink
+/// is closed when each of the handles has `close`d.
+///
+/// If more flexibility regarding the lifetimes is needed, `MPS` provides an
+/// alternative based on reference counting (which creates a runtime overhead).
 pub struct OwnerMPS<S>(RefCell<Shared<S>>);
 
 impl<S> OwnerMPS<S> {

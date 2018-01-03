@@ -1,8 +1,14 @@
 //! This crate provides wrappers around sinks that allow multiple, independent
 //! tasks to write to the same underlying sink.
+//!
+//! `MPS` uses reference counting: You create a new `MPS`, which consumes a sink.
+//! This `MPS` can then be cheaply cloned, and each one can be used to write to
+//! the same, underlying sink.
+//!
+//! `OwnerMPS` consumes a sink, and has a method to obtain `Handles` to it. These
+//! `Handles` can be used to write to the owner's sink, but they can not outlive
+//! it.
 #![deny(missing_docs)]
-
-// TODO update readme/cargo.toml description
 
 // TODO clean up Void import and git imports in general
 extern crate futures;

@@ -1,3 +1,4 @@
+// TODO into inner stuff
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -5,7 +6,7 @@ use futures::{Sink, StartSend, Poll};
 
 use shared::*;
 
-/// A *m*ulti *p*roducer *s*ink (`MPS`). This is a cloneable handle to a single
+/// A multi producer sink (`MPS`). This is a cloneable handle to a single
 /// sink of type `S`, and each handle can be used to write to the inner sink.
 ///
 /// Errors are simply propagated to the handle that triggered it, but they are
@@ -14,6 +15,10 @@ use shared::*;
 ///
 /// Each of the handles must invoke `close` before being dropped. The inner sink
 /// is closed when each of the handles has `close`d.
+///
+/// Internally, this uses reference counting to keep track of the clones.
+/// `OwnerMPS` provides a lifetimes-based alternative with lower runtime
+/// overhead.
 pub struct MPS<S> {
     shared: Rc<RefCell<Shared<S>>>,
     did_close: bool,
