@@ -14,5 +14,5 @@ ordermap = "0.3.3"
 [dev-dependencies]
 quickcheck = "0.4.1"
 rand = "0.3.18"
-atm-async-utils = { git = "https://github.com/AljoschaMeyer/atm-async-utils" }
-void = { git = "https://github.com/AljoschaMeyer/rust-void" }
+void = "1.0.2"
+atm-async-utils = "0.1.0"

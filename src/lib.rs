@@ -10,7 +10,6 @@
 //! it.
 #![deny(missing_docs)]
 
-// TODO clean up Void import and git imports in general
 extern crate futures;
 extern crate ordermap;
 
