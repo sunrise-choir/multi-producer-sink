@@ -2,13 +2,14 @@
 name = "multi-producer-sink"
 version = "0.1.0"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
-description = "Split a sink into multiple subsinks all writing to the same underlying sink."
-repository = "https://github.com/AljoschaMeyer/box-stream-rs"
+description = "A cloneable handle to sinks, allowing multiple tasks to write to the same underlying sink."
+repository = "https://github.com/AljoschaMeyer/multi-producer-sink"
 readme = "README.md"
 license = "GPL-3.0"
 
 [dependencies]
 futures = "0.1.17"
+ordermap = "0.3.3"
 
 [dev-dependencies]
 quickcheck = "0.4.1"
