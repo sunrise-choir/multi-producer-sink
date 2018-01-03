@@ -1,10 +1,8 @@
 use std::cell::RefCell;
 
-use futures::{Sink, AsyncSink, StartSend, Poll, Async};
-use futures::task::{self, Task};
-use ordermap::OrderSet;
+use futures::{Sink, StartSend, Poll};
 
-use id_task::IdTask;
+use shared::*;
 
 /// A multiple producer sink that works via lifetimes rather than reference
 /// counting. This wraps a sink, and allows to obtain handles to the inner sink
@@ -14,7 +12,7 @@ pub struct OwnerMPS<S>(RefCell<Shared<S>>);
 impl<S> OwnerMPS<S> {
     /// Create a new `OwnerMPS`, wrapping the given sink.
     pub fn new(sink: S) -> OwnerMPS<S> {
-        OwnerMPS(RefCell::new(Shared::new(sink)))
+        OwnerMPS(RefCell::new(Shared::new(sink, 1, 0)))
     }
 
     /// Consume the `OwnerMPS` and return ownership of the inner sink.
@@ -33,46 +31,37 @@ impl<S> OwnerMPS<S> {
     }
 }
 
-struct Shared<S> {
-    inner: S,
-    id_counter: usize,
-    tasks: OrderSet<IdTask>,
-    // The id of the handle on whose call the inner sink is currently blocking.
-    // Is set to zero when inner sink is not currently blocking.
-    current: usize,
-}
-
-impl<S> Shared<S> {
-    fn new(sink: S) -> Shared<S> {
-        Shared {
-            inner: sink,
-            id_counter: 1,
-            tasks: OrderSet::new(),
-            current: 0,
-        }
-    }
-
-    fn into_inner(self) -> S {
-        self.inner
-    }
-
-    fn next_id(&mut self) -> usize {
-        self.id_counter += 1;
-        return self.id_counter - 1;
-    }
-}
-
 /// A handle for using a sink, with static lifetime checking.
 pub struct Handle<'owner, S: 'owner> {
     owner: &'owner OwnerMPS<S>,
+    did_close: bool,
     id: usize,
 }
 
 impl<'owner, S> Handle<'owner, S> {
     /// Create a new `Handle` to the sink owned by the given owner.
     pub fn new(owner: &'owner OwnerMPS<S>) -> Handle<'owner, S> {
-        let id = owner.0.borrow_mut().next_id();
-        Handle { owner, id }
+        let mut shared = owner.0.borrow_mut();
+        let id = shared.next_id();
+        shared.increment_ref_count();
+
+        Handle {
+            owner,
+            did_close: false,
+            id,
+        }
+    }
+}
+
+/// Performs minimal cleanup to allow for correct closing behaviour
+impl<'owner, S> Drop for Handle<'owner, S> {
+    fn drop(&mut self) {
+        let mut shared = self.owner.0.borrow_mut();
+        if self.did_close {
+            shared.decrement_close_count();
+        }
+
+        shared.decrement_ref_count();
     }
 }
 
@@ -91,108 +80,31 @@ impl<'owner, S: Sink> Sink for Handle<'owner, S> {
     /// Tries to start sending to the underlying sink. Enqueues the task if the
     /// the sink is already blocking for another `Handle`.
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let mut shared = self.owner.0.borrow_mut();
-
-        // Either the inner sink is not blocking at all, or it is blocking for
-        // the handle which called this method. In both scenarios we can try to
-        // make progress.
-        if shared.current == 0 || self.id == shared.current {
-            match shared.inner.start_send(item) {
-                Ok(AsyncSink::Ready) => {
-                    // Done with this item. If further tasks are waiting, notify
-                    // the next one.
-                    shared.current = 0;
-
-                    let front;
-                    match shared.tasks.get_index(0) {
-                        None => {
-                            return Ok(AsyncSink::Ready);
-                        }
-                        Some(id_t) => {
-                            front = id_t.clone();
-                        }
-                    }
-
-                    front.task.notify();
-                    shared.tasks.remove(&front);
-                    return Ok(AsyncSink::Ready);
-                }
-
-                Ok(AsyncSink::NotReady(it)) => {
-                    // Inner sink is now (and may have already been) blocking on this handle.
-                    shared.current = self.id;
-                    Ok(AsyncSink::NotReady(it))
-                }
-
-                Err(e) => {
-                    shared.current = 0;
-                    Err(e)
-                }
-            }
-        } else {
-            // Can not make progress, enqueue the task.
-            shared
-                .tasks
-                .insert(IdTask::new(task::current(), self.id));
-            Ok(AsyncSink::NotReady(item))
-        }
+        self.owner.0.borrow_mut().do_start_send(item, self.id)
     }
 
     /// Tries to poll for completion on the underlying sink. Enqueues the task
     /// if the the sink is already blocking for another `Handle`.
     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        let mut shared = self.owner.0.borrow_mut();
-
-        // Either the inner sink is not blocking at all, or it is blocking for
-        // the handle which called this method. In both scenarios we can try to
-        // make progress.
-        if shared.current == 0 || self.id == shared.current {
-            match shared.inner.poll_complete() {
-                Ok(Async::Ready(())) => {
-                    // Done flushing. If further tasks are waiting, notify
-                    // the next one.
-                    shared.current = 0;
-
-                    let front;
-                    match shared.tasks.get_index(0) {
-                        None => {
-                            return Ok(Async::Ready(()));
-                        }
-                        Some(id_t) => {
-                            front = id_t.clone();
-                        }
-                    }
-
-                    front.task.notify();
-                    shared.tasks.remove(&front);
-                    return Ok(Async::Ready(()));
-                }
-
-                Ok(Async::NotReady) => {
-                    // Inner sink is now (and may have already been) blocking on this handle.
-                    shared.current = self.id;
-                    Ok(Async::NotReady)
-                }
-
-                Err(e) => {
-                    shared.current = 0;
-                    Err(e)
-                }
-            }
-        } else {
-            // Can not make progress, enqueue the task.
-            shared
-                .tasks
-                .insert(IdTask::new(task::current(), self.id));
-            Ok(Async::NotReady)
-        }
+        self.owner.0.borrow_mut().do_poll_complete(self.id)
     }
 
-    /// This simply delegates to `poll_complete`, but never actually `close`s
-    /// the underlying sink. To close it, use `into_inner` on the `OwnerMPS` and
-    /// then directly invoke `close` on the sink itself.
+    /// This only delegates to the `close` method of the inner sink if all other
+    /// active handles have already called close. Else, it simply flushes the
+    /// underlying sink, but does not close it.
+    ///
+    /// Calling `master.handle()` or `handle.clone()` after calling `close` leads
+    /// to ambiguity whether the inner sink has actually closed yet. It's still
+    /// safe, but not advisable.
     fn close(&mut self) -> Poll<(), Self::SinkError> {
-        self.poll_complete()
+        let mut shared = self.owner.0.borrow_mut();
+
+        if !self.did_close {
+            shared.increment_close_count();
+            self.did_close = true;
+        }
+
+        shared.do_close(self.id)
     }
 }
 
@@ -200,7 +112,7 @@ impl<'owner, S: Sink> Sink for Handle<'owner, S> {
 mod tests {
     use super::*;
 
-    use futures::{Future, Stream};
+    use futures::{Future, Stream, AsyncSink, Async};
     use futures::stream::iter_ok;
 
     use quickcheck::{QuickCheck, StdGen};
@@ -208,7 +120,6 @@ mod tests {
     use void::Void;
     use atm_async_utils::test_channel::*;
     use atm_async_utils::test_sink::*;
-    use atm_async_utils::sink_futures::Close;
 
     #[test]
     fn test_success() {
@@ -231,9 +142,7 @@ mod tests {
         let send_all2 = s2.send_all(iter_ok::<_, Void>(10..20));
         let send_all3 = s3.send_all(iter_ok::<_, Void>(20..30));
         let send_all4 = s4.send_all(iter_ok::<_, Void>(30..40));
-        let sending = send_all1
-            .join4(send_all2, send_all3, send_all4)
-            .and_then(|_| Close::new(owner.into_inner()));
+        let sending = send_all1.join4(send_all2, send_all3, send_all4);
 
         let (mut received, _) = receiver.collect().join(sending).wait().unwrap();
         received.sort();
@@ -254,5 +163,45 @@ mod tests {
         let s1 = s1.send(42).wait().unwrap();
         assert_eq!(s2.send(42).wait().err().unwrap(), 13);
         assert!(s1.send(42).wait().is_ok());
+    }
+
+    struct CloseTester(usize);
+
+    impl Sink for CloseTester {
+        type SinkItem = ();
+        type SinkError = ();
+
+        fn start_send(&mut self, _: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+            Ok(AsyncSink::Ready)
+        }
+
+        fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+            Ok(Async::Ready(()))
+        }
+
+        fn close(&mut self) -> Poll<(), Self::SinkError> {
+            self.0 += 1;
+            if self.0 > 1 {
+                Err(())
+            } else {
+                Ok(Async::Ready(()))
+            }
+        }
+    }
+
+    #[test]
+    fn test_close() {
+        let owner = OwnerMPS::new(CloseTester(0));
+        let mut s1 = owner.handle();
+        let mut s2 = owner.handle();
+
+        assert_eq!(s1.close(), Ok(Async::Ready(())));
+
+        {
+            let s3 = owner.handle();
+            let _ = s3.flush();
+        }
+
+        assert_eq!(s2.close(), Ok(Async::Ready(())));
     }
 }
