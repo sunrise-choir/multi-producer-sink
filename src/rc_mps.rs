@@ -40,8 +40,11 @@ impl<S> MPS<S> {
 /// Performs minimal cleanup to allow for correct closing behaviour
 impl<S> Drop for MPS<S> {
     fn drop(&mut self) {
+        let mut shared = self.shared.borrow_mut();
+        shared.decrement_ref_count();
+
         if self.did_close {
-            self.shared.borrow_mut().decrement_close_count();
+            shared.decrement_close_count();
         }
     }
 }
