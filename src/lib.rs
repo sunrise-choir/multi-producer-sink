@@ -3,6 +3,9 @@
 #![deny(missing_docs)]
 
 extern crate futures_core;
+extern crate futures_channel;
+extern crate futures_sink;
+extern crate futures_util;
 extern crate indexmap;
 
 #[cfg(test)]

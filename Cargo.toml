@@ -9,6 +9,9 @@ license = "AGPL-3.0"
 
 [dependencies]
 futures-core = "0.2.0-alpha"
+futures-channel = "0.2.0-alpha"
+futures-sink = "0.2.0-alpha"
+futures-util = "0.2.0-alpha"
 indexmap = "0.4.1"
 
 [dev-dependencies]
