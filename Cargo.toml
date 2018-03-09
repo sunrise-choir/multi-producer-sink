@@ -5,7 +5,7 @@ authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "Provides handles to sinks, allowing multiple different tasks to write to the same underlying sink."
 repository = "https://github.com/AljoschaMeyer/multi-producer-sink"
 readme = "README.md"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 
 [dependencies]
 futures = "0.1.17"
