@@ -1,6 +1,6 @@
 [package]
 name = "multi-producer-sink"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "Provides handles to sinks, allowing multiple different tasks to write to the same underlying sink."
 repository = "https://github.com/AljoschaMeyer/multi-producer-sink"
