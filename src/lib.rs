@@ -15,11 +15,13 @@ extern crate futures;
 
 mod shared;
 mod unsync;
+mod sync;
 
 use futures_core::Future;
 use futures_sink::Sink;
 
 pub use unsync::*;
+pub use sync::*;
 
 /// A multi producer sink (`MPS`). This is a cloneable handle to a single
 /// sink of type `S`, and each handle can be used to write to the inner sink.
