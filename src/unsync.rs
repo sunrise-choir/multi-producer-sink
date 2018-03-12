@@ -11,14 +11,15 @@ use futures_util::future::Then;
 use futures_core::task::Context;
 
 use shared::*;
+use super::MPS;
 
-/// Create a new MPS, wrapping the given sink. Also returns a future that
-/// emits the wrapped sink once the last `MPS` handle has been closed, dropped or if the wrapped
+/// Create a new UnsyncMPS, wrapping the given sink. Also returns a future that
+/// emits the wrapped sink once the last `UnsyncMPS` handle has been closed, dropped or if the wrapped
 /// sink errored.
-pub fn mps<S: Sink>(sink: S) -> (MPS<S>, Done<S>) {
-    let (done, sender) = Done::new();
+pub fn unsync_mps<S: Sink>(sink: S) -> (UnsyncMPS<S>, UnsyncDone<S>) {
+    let (done, sender) = UnsyncDone::new();
 
-    (MPS {
+    (UnsyncMPS {
          shared: Rc::new(RefCell::new(Shared::new(sink, sender))),
          did_close: false,
          id: 1,
@@ -30,25 +31,25 @@ pub fn mps<S: Sink>(sink: S) -> (MPS<S>, Done<S>) {
 ///
 /// Yields back the wrapped sink in an `Ok` when the last handle is closed or dropped.
 /// Emits the first error and the wrapped sink as an `Err` if the sink errors.
-pub struct Done<S: Sink>(Then<Receiver<Result<S, (S::SinkError, S)>>,
-                               Result<S, (S::SinkError, S)>,
-                               fn(Result<Result<S, (S::SinkError, S)>, Canceled>)
-                                  -> Result<S, (S::SinkError, S)>>);
+pub struct UnsyncDone<S: Sink>(Then<Receiver<Result<S, (S::SinkError, S)>>,
+                                     Result<S, (S::SinkError, S)>,
+                                     fn(Result<Result<S, (S::SinkError, S)>, Canceled>)
+                                        -> Result<S, (S::SinkError, S)>>);
 
-impl<S: Sink> Done<S> {
-    fn new() -> (Done<S>, Sender<Result<S, (S::SinkError, S)>>) {
+impl<S: Sink> UnsyncDone<S> {
+    fn new() -> (UnsyncDone<S>, Sender<Result<S, (S::SinkError, S)>>) {
         let (sender, receiver) = channel();
 
-        (Done(receiver.then(|result| match result {
-                                Ok(Ok(sink)) => Ok(sink),
-                                Ok(Err((err, sink))) => Err((err, sink)),
-                                Err(_) => unreachable!(),
-                            })),
+        (UnsyncDone(receiver.then(|result| match result {
+                                      Ok(Ok(sink)) => Ok(sink),
+                                      Ok(Err((err, sink))) => Err((err, sink)),
+                                      Err(_) => unreachable!(),
+                                  })),
          sender)
     }
 }
 
-impl<S: Sink> Future for Done<S> {
+impl<S: Sink> Future for UnsyncDone<S> {
     type Item = S;
     type Error = (S::SinkError, S);
 
@@ -57,16 +58,16 @@ impl<S: Sink> Future for Done<S> {
     }
 }
 
-/// A multi producer sink (`MPS`). This is a cloneable handle to a single
+/// A multi producer sink (`UnsyncMPS`). This is a cloneable handle to a single
 /// sink of type `S`, and each handle can be used to write to the inner sink.
 ///
-/// An error is propagated as a `Err(Some(err))` to the handle that triggered it,
-/// and all other handles emit an `Err(None)`. All further polling will always
-/// yield `Err(None)`.
+/// An error is signaled via the `Done`, the sink methods themselves only return `Err(())`. Upon
+/// encountering an error, all handles are notified and they return `Err(())`. All further polling
+/// will always yield `Err(None)` as well.
 ///
-/// Unless an error occured, each of the handles must invoke `close` before
-/// being dropped. The inner sink is closed when each of the handles has `close`d.
-pub struct MPS<S: Sink> {
+/// Unless an error occured, each of the handles must invoke `close` before being dropped. The
+/// inner sink is closed when each of the handles has `close`d and emitted via the `Done`.
+pub struct UnsyncMPS<S: Sink> {
     shared: Rc<RefCell<Shared<S>>>,
     did_close: bool,
     // id may never be 0, 0 signals that nothing is blocking
@@ -74,7 +75,7 @@ pub struct MPS<S: Sink> {
 }
 
 /// Performs minimal cleanup to allow for correct closing behaviour
-impl<S: Sink> Drop for MPS<S> {
+impl<S: Sink> Drop for UnsyncMPS<S> {
     fn drop(&mut self) {
         if self.did_close {
             self.shared.borrow_mut().decrement_close_count();
@@ -82,10 +83,10 @@ impl<S: Sink> Drop for MPS<S> {
     }
 }
 
-impl<S: Sink> Clone for MPS<S> {
+impl<S: Sink> Clone for UnsyncMPS<S> {
     /// Returns a new handle to the same underlying sink.
-    fn clone(&self) -> MPS<S> {
-        MPS {
+    fn clone(&self) -> UnsyncMPS<S> {
+        UnsyncMPS {
             shared: self.shared.clone(),
             did_close: false,
             id: self.shared.borrow_mut().next_id(),
@@ -93,7 +94,7 @@ impl<S: Sink> Clone for MPS<S> {
     }
 }
 
-impl<S: Sink> Sink for MPS<S> {
+impl<S: Sink> Sink for UnsyncMPS<S> {
     type SinkItem = S::SinkItem;
     type SinkError = ();
 
@@ -126,6 +127,14 @@ impl<S: Sink> Sink for MPS<S> {
         }
 
         shared.do_poll_close(cx, self.id, Rc::strong_count(&self.shared) == close_count)
+    }
+}
+
+impl<S: Sink> MPS<S> for UnsyncMPS<S> {
+    type Done = UnsyncDone<S>;
+
+    fn mps(sink: S) -> (Self, Self::Done) {
+        unsync_mps(sink)
     }
 }
 
