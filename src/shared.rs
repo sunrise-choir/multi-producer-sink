@@ -1,14 +1,15 @@
 use std::hash::{Hash, Hasher};
 
 use indexmap::IndexSet;
-use futures_core::{Poll, Async};
+use futures_core::Poll;
+use futures_core::Async::{Ready, Pending};
 use futures_core::task::{Waker, Context};
 use futures_sink::Sink;
 use futures_channel::oneshot::Sender;
 
-pub struct Shared<S> {
+pub struct Shared<S: Sink> {
     inner: Option<S>,
-    sender: Option<Sender<Result<S, S>>>,
+    sender: Option<Sender<Result<S, (S::SinkError, S)>>>,
     // Counter to provide unique ids to each handle (because we can't check
     // `Waker`s for equality directly), see https://github.com/alexcrichton/futures-rs/issues/670
     id_counter: usize,
@@ -23,11 +24,10 @@ pub struct Shared<S> {
     // The id of the handle on whose call the inner sink is currently blocking.
     // Is set to zero when inner sink is not currently blocking.
     current: usize,
-    errored: bool,
 }
 
-impl<S> Shared<S> {
-    pub fn new(sink: S, sender: Sender<Result<S, S>>) -> Shared<S> {
+impl<S: Sink> Shared<S> {
+    pub fn new(sink: S, sender: Sender<Result<S, (S::SinkError, S)>>) -> Shared<S> {
         Shared {
             inner: Some(sink),
             sender: Some(sender),
@@ -35,7 +35,6 @@ impl<S> Shared<S> {
             close_count: 0,
             wakers: IndexSet::new(),
             current: 0,
-            errored: false,
         }
     }
 
@@ -54,9 +53,9 @@ impl<S> Shared<S> {
 }
 
 impl<S: Sink> Shared<S> {
-    pub fn do_poll_ready(&mut self, cx: &mut Context, id: usize) -> Poll<(), Option<S::SinkError>> {
-        if self.errored {
-            return Err(None);
+    pub fn do_poll_ready(&mut self, cx: &mut Context, id: usize) -> Poll<(), ()> {
+        if self.is_done() {
+            return Err(());
         }
 
         let mut inner = self.inner.take().unwrap();
@@ -66,31 +65,31 @@ impl<S: Sink> Shared<S> {
         // make progress.
         if self.current == 0 || id == self.current {
             match inner.poll_ready(cx) {
-                Ok(Async::Ready(())) => {self.wake_next(inner); Ok(Async::Ready(()))}
+                Ok(Ready(())) => {self.wake_next(inner); Ok(Ready(()))}
 
-                Ok(Async::Pending) => {
+                Ok(Pending) => {
                     // Inner sink is now (and may have already been) blocking on this handle.
                     self.current = id;
                     self.inner = Some(inner);
-                    Ok(Async::Pending)
+                    Ok(Pending)
                 }
 
                 Err(err) => {
-                    self.error(inner);
-                    Err(Some(err))
+                    self.error(err, inner);
+                    Err(())
                 }
             }
         } else {
             // Can not make progress, enqueue the task.
             self.wakers.insert(IdWaker::new(cx.waker(), id));
             self.inner = Some(inner);
-            Ok(Async::Pending)
+            Ok(Pending)
         }
     }
 
-    pub fn do_start_send(&mut self, item: S::SinkItem) -> Result<(), Option<S::SinkError>> {
-        if self.errored {
-            return Err(None);
+    pub fn do_start_send(&mut self, item: S::SinkItem) -> Result<(), ()> {
+        if self.is_done() {
+            return Err(());
         }
 
         let mut inner = self.inner.take().unwrap();
@@ -98,15 +97,15 @@ impl<S: Sink> Shared<S> {
         match inner.start_send(item) {
             Ok(()) => {self.inner = Some(inner); Ok(())}
             Err(err) => {
-                self.error(inner);
-                Err(Some(err))
+                self.error(err, inner);
+                Err(())
             }
         }
     }
 
-    pub fn do_poll_flush(&mut self, cx: &mut Context, id: usize) -> Poll<(), Option<S::SinkError>> {
-        if self.errored {
-            return Err(None);
+    pub fn do_poll_flush(&mut self, cx: &mut Context, id: usize) -> Poll<(), ()> {
+        if self.is_done() {
+            return Err(());
         }
 
         let mut inner = self.inner.take().unwrap();
@@ -116,25 +115,25 @@ impl<S: Sink> Shared<S> {
         // make progress.
         if self.current == 0 || id == self.current {
             match inner.poll_flush(cx) {
-                Ok(Async::Ready(())) => {self.wake_next(inner); Ok(Async::Ready(()))}
+                Ok(Ready(())) => {self.wake_next(inner); Ok(Ready(()))}
 
-                Ok(Async::Pending) => {
+                Ok(Pending) => {
                     // Inner sink is now (and may have already been) blocking on this handle.
                     self.current = id;
                     self.inner = Some(inner);
-                    Ok(Async::Pending)
+                    Ok(Pending)
                 }
 
                 Err(err) => {
-                    self.error(inner);
-                    Err(Some(err))
+                    self.error(err, inner);
+                    Err(())
                 }
             }
         } else {
             // Can not make progress, enqueue the task.
             self.wakers.insert(IdWaker::new(cx.waker(), id));
             self.inner = Some(inner);
-            Ok(Async::Pending)
+            Ok(Pending)
         }
     }
 
@@ -142,9 +141,9 @@ impl<S: Sink> Shared<S> {
                          cx: &mut Context,
                          id: usize,
                          really_close: bool)
-                         -> Poll<(), Option<S::SinkError>> {
-        if self.errored {
-            return Err(None);
+                         -> Poll<(), ()> {
+        if self.is_done() {
+            return Err(());
         }
 
         let mut inner = self.inner.take().unwrap();
@@ -156,44 +155,44 @@ impl<S: Sink> Shared<S> {
             // close the inner sink
             if (really_close) && self.wakers.is_empty() {
                 match inner.poll_close(cx) {
-                    Ok(Async::Ready(())) => {
+                    Ok(Ready(())) => {
                         // Done closing.
                         self.current = 0;
 
                         self.wakers.pop();
 
                         let _ = self.sender.take().unwrap().send(Ok(inner));
-                        Ok(Async::Ready(()))
+                        Ok(Ready(()))
                     }
 
-                    Ok(Async::Pending) => {
+                    Ok(Pending) => {
                         // Inner sink is now (and may have already been) blocking on this handle.
                         self.current = id;
                         self.inner = Some(inner);
-                        Ok(Async::Pending)
+                        Ok(Pending)
                     }
 
-                    Err(e) => {
-                        self.error(inner);
-                        Err(Some(e))
+                    Err(err) => {
+                        self.error(err, inner);
+                        Err(())
                     }
                 }
 
                 // only flush
             } else {
                 match inner.poll_flush(cx) {
-                    Ok(Async::Ready(())) => {self.wake_next(inner); Ok(Async::Ready(()))}
+                    Ok(Ready(())) => {self.wake_next(inner); Ok(Ready(()))}
 
-                    Ok(Async::Pending) => {
+                    Ok(Pending) => {
                         // Inner sink is now (and may have already been) blocking on this handle.
                         self.current = id;
                         self.inner = Some(inner);
-                        Ok(Async::Pending)
+                        Ok(Pending)
                     }
 
                     Err(err) => {
-                        self.error(inner);
-                        Err(Some(err))
+                        self.error(err, inner);
+                        Err(())
                     }
                 }
             }
@@ -201,8 +200,12 @@ impl<S: Sink> Shared<S> {
             // Can not make progress, enqueue the task.
             self.wakers.insert(IdWaker::new(cx.waker(), id));
             self.inner = Some(inner);
-            Ok(Async::Pending)
+            Ok(Pending)
         }
+    }
+
+    fn is_done(&self) -> bool {
+        self.sender.is_none()
     }
 
     fn wake(&mut self) {
@@ -219,10 +222,9 @@ impl<S: Sink> Shared<S> {
         self.wakers.remove(&front);
     }
 
-    fn error(&mut self, inner: S) {
-        self.errored = true;
+    fn error(&mut self, err: S::SinkError, inner: S) {
         self.current = 0;
-        let _ = self.sender.take().unwrap().send(Err(inner));
+        let _ = self.sender.take().unwrap().send(Err((err, inner)));
         self.wake();
     }
 

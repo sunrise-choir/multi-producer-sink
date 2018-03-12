@@ -15,7 +15,7 @@ use shared::*;
 /// Create a new MPS, wrapping the given sink. Also returns a future that
 /// emits the wrapped sink once the last `MPS` handle has been closed, dropped or if the wrapped
 /// sink errored.
-pub fn mps<S>(sink: S) -> (MPS<S>, Done<S>) {
+pub fn mps<S: Sink>(sink: S) -> (MPS<S>, Done<S>) {
     let (done, sender) = Done::new();
 
     (MPS {
@@ -29,27 +29,28 @@ pub fn mps<S>(sink: S) -> (MPS<S>, Done<S>) {
 /// A future that signals when the wrapped sink is done.
 ///
 /// Yields back the wrapped sink in an `Ok` when the last handle is closed or dropped.
-/// Emits the wrapped sink as an `Err` if it errors.
-pub struct Done<S>(Then<Receiver<Result<S, S>>,
-                         Result<S, S>,
-                         fn(Result<Result<S, S>, Canceled>) -> Result<S, S>>);
+/// Emits the first error and the wrapped sink as an `Err` if the sink errors.
+pub struct Done<S: Sink>(Then<Receiver<Result<S, (S::SinkError, S)>>,
+                               Result<S, (S::SinkError, S)>,
+                               fn(Result<Result<S, (S::SinkError, S)>, Canceled>)
+                                  -> Result<S, (S::SinkError, S)>>);
 
-impl<S> Done<S> {
-    fn new() -> (Done<S>, Sender<Result<S, S>>) {
+impl<S: Sink> Done<S> {
+    fn new() -> (Done<S>, Sender<Result<S, (S::SinkError, S)>>) {
         let (sender, receiver) = channel();
 
         (Done(receiver.then(|result| match result {
                                 Ok(Ok(sink)) => Ok(sink),
-                                Ok(Err(sink)) => Err(sink),
+                                Ok(Err((err, sink))) => Err((err, sink)),
                                 Err(_) => unreachable!(),
                             })),
          sender)
     }
 }
 
-impl<S> Future for Done<S> {
+impl<S: Sink> Future for Done<S> {
     type Item = S;
-    type Error = S;
+    type Error = (S::SinkError, S);
 
     fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
         self.0.poll(cx)
@@ -65,7 +66,7 @@ impl<S> Future for Done<S> {
 ///
 /// Unless an error occured, each of the handles must invoke `close` before
 /// being dropped. The inner sink is closed when each of the handles has `close`d.
-pub struct MPS<S> {
+pub struct MPS<S: Sink> {
     shared: Rc<RefCell<Shared<S>>>,
     did_close: bool,
     // id may never be 0, 0 signals that nothing is blocking
@@ -73,7 +74,7 @@ pub struct MPS<S> {
 }
 
 /// Performs minimal cleanup to allow for correct closing behaviour
-impl<S> Drop for MPS<S> {
+impl<S: Sink> Drop for MPS<S> {
     fn drop(&mut self) {
         if self.did_close {
             self.shared.borrow_mut().decrement_close_count();
@@ -81,12 +82,11 @@ impl<S> Drop for MPS<S> {
     }
 }
 
-impl<S> Clone for MPS<S> {
+impl<S: Sink> Clone for MPS<S> {
     /// Returns a new handle to the same underlying sink.
     fn clone(&self) -> MPS<S> {
         MPS {
             shared: self.shared.clone(),
-            // New handle has not closed yet, so always set this to false.
             did_close: false,
             id: self.shared.borrow_mut().next_id(),
         }
@@ -95,13 +95,13 @@ impl<S> Clone for MPS<S> {
 
 impl<S: Sink> Sink for MPS<S> {
     type SinkItem = S::SinkItem;
-    type SinkError = Option<S::SinkError>;
+    type SinkError = ();
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<(), Option<S::SinkError>> {
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<(), Self::SinkError> {
         self.shared.borrow_mut().do_poll_ready(cx, self.id)
     }
 
-    fn start_send(&mut self, item: S::SinkItem) -> Result<(), Option<S::SinkError>> {
+    fn start_send(&mut self, item: S::SinkItem) -> Result<(), Self::SinkError> {
         self.shared.borrow_mut().do_start_send(item)
     }
 
@@ -148,13 +148,13 @@ mod tests {
         let s3 = s1.clone();
         let s4 = s1.clone();
 
-        let send_all1 = s1.send_all(iter_ok::<_, Never>(0..10).map(|i| Ok(i)))
+        let send_all1 = s1.send_all(iter_ok::<_, ()>(0..10).map(|i| Ok(i)))
             .and_then(|(sender, _)| close(sender));
-        let send_all2 = s2.send_all(iter_ok::<_, Never>(10..20).map(|i| Ok(i)))
+        let send_all2 = s2.send_all(iter_ok::<_, ()>(10..20).map(|i| Ok(i)))
             .and_then(|(sender, _)| close(sender));
-        let send_all3 = s3.send_all(iter_ok::<_, Never>(20..30).map(|i| Ok(i)))
+        let send_all3 = s3.send_all(iter_ok::<_, ()>(20..30).map(|i| Ok(i)))
             .and_then(|(sender, _)| close(sender));
-        let send_all4 = s4.send_all(iter_ok::<_, Never>(30..40).map(|i| Ok(i)))
+        let send_all4 = s4.send_all(iter_ok::<_, ()>(30..40).map(|i| Ok(i)))
             .and_then(|(sender, _)| close(sender));
         let sending = send_all1
             .join4(send_all2, send_all3, send_all4)
