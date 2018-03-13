@@ -1,8 +1,6 @@
 //! A threadsafe multi-producer-sink.
 
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::SeqCst;
 
 use futures_core::{Future, Poll};
 use futures_channel::oneshot::{channel, Sender, Receiver, Canceled};
@@ -22,7 +20,7 @@ pub fn sync_mps<S: Sink>(sink: S) -> (SyncMPS<S>, SyncDone<S>) {
 
     (SyncMPS {
          shared: Arc::new(RwLock::new(Shared::new(sink, sender))),
-         did_close: AtomicBool::new(false),
+         did_close: false,
          id: 1,
      },
      done)
@@ -70,7 +68,7 @@ impl<S: Sink> Future for SyncDone<S> {
 /// inner sink is closed when each of the handles has `close`d and emitted via the `Done`.
 pub struct SyncMPS<S: Sink> {
     shared: Arc<RwLock<Shared<S>>>,
-    did_close: AtomicBool,
+    did_close: bool,
     // id may never be 0, 0 signals that nothing is blocking
     id: usize,
 }
@@ -78,7 +76,7 @@ pub struct SyncMPS<S: Sink> {
 /// Performs minimal cleanup to allow for correct closing behaviour
 impl<S: Sink> Drop for SyncMPS<S> {
     fn drop(&mut self) {
-        if self.did_close.load(SeqCst) {
+        if self.did_close {
             self.shared.write().unwrap().decrement_close_count();
         }
     }
@@ -89,7 +87,7 @@ impl<S: Sink> Clone for SyncMPS<S> {
     fn clone(&self) -> SyncMPS<S> {
         SyncMPS {
             shared: self.shared.clone(),
-            did_close: AtomicBool::new(false),
+            did_close: false,
             id: self.shared.write().unwrap().next_id(),
         }
     }
@@ -121,10 +119,10 @@ impl<S: Sink> Sink for SyncMPS<S> {
         let mut shared = self.shared.write().unwrap();
         let mut close_count = shared.close_count;
 
-        if !self.did_close.load(SeqCst) {
+        if !self.did_close {
             shared.increment_close_count();
             close_count += 1;
-            self.did_close.store(true, SeqCst);
+            self.did_close = true;
         }
 
         shared.do_poll_close(cx, self.id, Arc::strong_count(&self.shared) == close_count)
