@@ -3,9 +3,9 @@ name = "multi-producer-sink"
 version = "0.5.2"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "Provides handles to sinks, allowing multiple different tasks to write to the same underlying sink."
-repository = "https://github.com/AljoschaMeyer/multi-producer-sink"
+repository = "https://github.com/sunrise-choir/multi-producer-sink"
 readme = "README.md"
-license = "AGPL-3.0"
+license = "LGPL-3.0"
 
 [dependencies]
 futures-core = "0.2.0-alpha"
